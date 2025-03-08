@@ -1,0 +1,110 @@
+#!/bin/bash
+
+# Archivo de log
+LOG_FILE="ssh-security.log"
+echo "🚀 Inicio de la securización de SSH" > $LOG_FILE
+echo "Fecha: $(date)" >> $LOG_FILE
+
+# Solicitar puerto SSH
+read -p "🔢 Ingresa el puerto SSH (recomendado > 1024): " SSH_PORT
+
+# Solicitar clave pública SSH
+read -p "🔑 Pega tu clave pública SSH (RSA, ed25519, etc.): " SSH_KEY
+
+# Verificar entrada de clave pública
+if [[ -z "$SSH_KEY" ]]; then
+    echo "⚠️ No se ingresó una clave pública. Abortando..." | tee -a $LOG_FILE
+    exit 1
+fi
+
+echo "🚀 Iniciando instalación y securización de SSH en Ubuntu..." | tee -a $LOG_FILE
+
+# 1️⃣ Actualizar sistema
+echo "🔄 Actualizando paquetes..." | tee -a $LOG_FILE
+sudo apt update && sudo apt upgrade -y
+
+# 2️⃣ Instalar OpenSSH Server si no está instalado
+echo "🔑 Instalando OpenSSH Server..." | tee -a $LOG_FILE
+sudo apt install -y openssh-server
+
+# 3️⃣ Configurar SSH
+echo "🛠 Configurando SSH en el puerto $SSH_PORT..." | tee -a $LOG_FILE
+
+# Modificar el archivo de configuración
+sudo sed -i "s/^#Port 22/Port $SSH_PORT/g" /etc/ssh/sshd_config
+sudo sed -i "s/^PermitRootLogin yes/PermitRootLogin no/g" /etc/ssh/sshd_config
+sudo sed -i "s/^#PermitRootLogin prohibit-password/PermitRootLogin no/g" /etc/ssh/sshd_config
+sudo sed -i "s/^PasswordAuthentication yes/PasswordAuthentication no/g" /etc/ssh/sshd_config
+sudo sed -i "s/^#PasswordAuthentication no/PasswordAuthentication no/g" /etc/ssh/sshd_config
+
+# 4️⃣ Agregar clave pública SSH al usuario actual
+echo "🔑 Agregando clave pública SSH..." | tee -a $LOG_FILE
+mkdir -p ~/.ssh
+echo "$SSH_KEY" >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+chmod 700 ~/.ssh
+
+# Aplicar cambios y reiniciar SSH
+echo "🔄 Reiniciando SSH..." | tee -a $LOG_FILE
+sudo systemctl restart ssh
+
+# 5️⃣ Verificar si el Firewall UFW está instalado
+if ! command -v ufw &> /dev/null
+then
+    echo "🔥 UFW no está instalado. Instalándolo ahora..." | tee -a $LOG_FILE
+    sudo apt install -y ufw
+fi
+
+# 6️⃣ Configurar Firewall (UFW)
+echo "🔥 Configurando Firewall (UFW) para permitir SSH en el puerto $SSH_PORT..." | tee -a $LOG_FILE
+sudo ufw allow $SSH_PORT/tcp
+sudo ufw enable -y
+
+# 7️⃣ Instalar y configurar Fail2Ban
+echo "🛡 Instalando Fail2Ban..." | tee -a $LOG_FILE
+sudo apt install -y fail2ban
+
+# Configurar Fail2Ban para SSH
+echo "📑 Configurando reglas de Fail2Ban..." | tee -a $LOG_FILE
+sudo bash -c 'cat > /etc/fail2ban/jail.local <<EOL
+[sshd]
+enabled = true
+port = '$SSH_PORT'
+maxretry = 5
+bantime = 3600
+EOL'
+
+# Reiniciar Fail2Ban
+sudo systemctl restart fail2ban
+sudo systemctl enable fail2ban
+
+# 8️⃣ Generar archivo de log con verificaciones finales
+echo "📝 Generando informe de seguridad en $LOG_FILE..." | tee -a $LOG_FILE
+{
+    echo "✅ Verificación final de seguridad:"
+    echo "-----------------------------------"
+    echo "📌 Fecha: $(date)"
+    echo "🔐 SSH ahora usa el puerto: $SSH_PORT"
+    echo "⚠️ La autenticación por contraseña está deshabilitada."
+    echo "🔑 Clave pública SSH agregada correctamente."
+    echo "🔥 Firewall UFW está habilitado y permite el puerto $SSH_PORT."
+    echo "🛡 Fail2Ban activado para proteger el acceso SSH."
+    echo "-----------------------------------"
+    echo "🔍 Verificando estado del servicio SSH:"
+    sudo systemctl status ssh | grep Active
+    echo "🔍 Verificando puertos abiertos en SSH:"
+    sudo ss -tulnp | grep ssh
+    echo "🔍 Verificando reglas del firewall UFW:"
+    sudo ufw status verbose
+    echo "🔍 Verificando estado de Fail2Ban:"
+    sudo fail2ban-client status sshd
+} >> $LOG_FILE
+
+# 9️⃣ Mostrar resumen final
+echo "✅ Configuración finalizada." | tee -a $LOG_FILE
+echo "🔐 SSH ahora usa el puerto: $SSH_PORT" | tee -a $LOG_FILE
+echo "⚠️ La autenticación por contraseña está deshabilitada." | tee -a $LOG_FILE
+echo "🔑 Clave pública SSH agregada correctamente." | tee -a $LOG_FILE
+echo "🔥 Firewall UFW está habilitado y permite el puerto $SSH_PORT." | tee -a $LOG_FILE
+echo "🛡 Fail2Ban activado para proteger el acceso SSH." | tee -a $LOG_FILE
+echo "📄 Informe de seguridad guardado en: $LOG_FILE" | tee -a $LOG_FILE

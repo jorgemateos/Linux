@@ -1,0 +1,449 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# dockctl — Instalación, hardening y utilidades para Docker + Compose
+# Probado en Ubuntu Server 24.04 LTS
+
+# ====== CONFIG BASE ======
+DOCKER_BRIDGE_CIDR="172.20.0.0/16"
+CONTAINERS_ROOT="/opt/share/containers"
+BACKUP_ROOT="/backup"
+SCRIPT_PATH="/opt/share/dockctl"
+MENU_PATH="/opt/share/dockmenu"
+DEFAULT_EDITOR="${EDITOR:-nano}"
+
+DOCKER_USER="${SUDO_USER:-$(whoami)}"
+
+# ====== HELPERS ======
+say() { echo -e "\e[1;32m[✔]\e[0m $*"; }
+warn() { echo -e "\e[1;33m[~]\e[0m $*"; }
+err() { echo -e "\e[1;31m[✘]\e[0m $*" >&2; }
+die() { err "$*"; exit 1; }
+need_root() { [[ $EUID -eq 0 ]] || die "Ejecuta como root (sudo)."; }
+ensure_dirs() { mkdir -p "$CONTAINERS_ROOT" "$BACKUP_ROOT"; }
+
+timestamp() { date +"%Y%m%d-%H%M%S"; }
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Falta comando: $1";
+}
+
+compose() {
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    docker compose "$@"
+  else
+    die "No está docker compose plugin. Ejecuta: sudo $SCRIPT_PATH install"
+  fi
+}
+
+# ====== INSTALACIÓN DOCKER + COMPOSE ======
+do_install() {
+  need_root
+  
+  # Paso 1: Instalar dependencias básicas
+  say "Paso 1/4: Instalando dependencias básicas..."
+  apt-get update -y
+  apt-get install -y ca-certificates curl gnupg ufw lsb-release
+
+  # Paso 2: Agregar la clave GPG de Docker
+  say "Paso 2/4: Agregando clave GPG de Docker..."
+  if [[ ! -f "/etc/apt/keyrings/docker.gpg" ]]; then
+    /usr/bin/install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+  else
+    warn "Clave GPG de Docker ya existente. Omitiendo este paso."
+  fi
+
+  # Paso 3: Agregar el repositorio de Docker
+  say "Paso 3/4: Agregando el repositorio de Docker..."
+  if ! grep -q "download.docker.com/linux/ubuntu" /etc/apt/sources.list.d/docker.list 2>/dev/null; then
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list >/dev/null
+  else
+    warn "El repositorio de Docker ya existe. Omitiendo este paso."
+  fi
+  apt-get update -y
+
+  # Paso 4: Instalar los paquetes de Docker
+  say "Paso 4/4: Instalando Docker Engine y plugins..."
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || die "Fallo al instalar los paquetes de Docker."
+
+  systemctl enable --now docker
+
+  if ! getent group docker >/dev/null; then
+    groupadd docker
+  fi
+  usermod -aG docker "$DOCKER_USER" || true
+
+  ensure_dirs
+  say "Instalación base completa."
+  say "👉 Cierra sesión y vuelve a entrar para que surtan efecto los grupos (docker)."
+
+  # Generar menú automáticamente tras la instalación
+  mkmenu || warn "No se pudo generar el menú automáticamente. Puedes crearlo con: sudo $SCRIPT_PATH mkmenu"
+}
+
+# ====== HARDENING: daemon.json, userns-remap, logs, live-restore, IPv6 off ======
+harden() {
+  need_root
+  require_cmd docker
+  say "Aplicando hardening y saneamiento de configuración..."
+
+  if ! id -u dockremap &>/dev/null; then
+    useradd -r -s /usr/sbin/nologin dockremap || true
+  fi
+  if ! getent group dockremap &>/dev/null; then
+    groupadd -r dockremap || true
+  fi
+
+  if ! grep -q '^dockremap:' /etc/subuid; then echo "dockremap:165536:65536" >> /etc/subuid; fi
+  if ! grep -q '^dockremap:' /etc/subgid; then echo "dockremap:165536:65536" >> /etc/subgid; fi
+
+  /usr/bin/install -d -m 0755 /etc/docker
+  cat >/etc/docker/daemon.json <<JSON
+{
+  "userns-remap": "dockremap",
+  "live-restore": true,
+  "ipv6": false,
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "default-address-pools": [
+    { "base": "${DOCKER_BRIDGE_CIDR}", "size": 24 }
+  ]
+}
+JSON
+
+  if command -v ufw &>/dev/null; then
+    sed -ri 's/^#?DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+    mkdir -p /etc/ufw
+    if ! grep -q "DOCKER-USER" /etc/ufw/before.rules; then
+      cat >>/etc/ufw/before.rules <<'RULES'
+
+# docker cortesía: permitir conexiones establecidas/relacionadas
+*filter
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-USER -i lo -j ACCEPT
+-A DOCKER-USER -j RETURN
+COMMIT
+RULES
+    fi
+
+    ufw reload || true
+    say "UFW ajustado. Expón puertos caso a caso con 'ufw allow <puerto>' si lo necesitas."
+  fi
+
+  systemctl restart docker
+  say "Hardening aplicado. (userns, live-restore, logs y redes por defecto saneadas)"
+}
+
+# ====== UTILIDADES STACKS ======
+stack_path() { echo "${CONTAINERS_ROOT}/$1"; }
+
+new_stack() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "Uso: $0 new <stack>";
+  local base; base="$(stack_path "$name")"
+  if [[ -e "$base" ]]; then die "Ya existe: $base"; fi
+
+  mkdir -p "$base"/{secrets,data}
+  touch "$base/.env"
+  chown -R "$DOCKER_USER:$DOCKER_USER" "$base" || true
+  chmod 600 "$base"/secrets || true
+
+  cat >"$base/docker-compose.yml" <<'YAML'
+services:
+  app:
+    image: nginx:stable
+    container_name: ${STACK}_app
+    ports:
+      - "8080:80"
+    env_file:
+      - .env
+    volumes:
+      - ./data/html:/usr/share/nginx/html:ro
+    restart: unless-stopped
+YAML
+
+  cat >"$base/.env" <<EOF
+STACK=${name}
+EOF
+
+  mkdir -p "$base/data/html"
+  echo "<h1>${name} OK</h1>" > "$base/data/html/index.html"
+
+  say "Stack creado en: $base"
+  say "Edita: $base/docker-compose.yml y $base/.env"
+}
+
+stack_up() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "Uso: $0 up <stack>";
+  local base; base="$(stack_path "$name")"
+  [[ -f "$base/docker-compose.yml" ]] || die "No existe compose en $base";
+  (cd "$base" && compose up -d)
+  say "Stack '$name' levantado."
+}
+
+stack_down() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "Uso: $0 down <stack>";
+  local base; base="$(stack_path "$name")"
+  [[ -f "$base/docker-compose.yml" ]] || die "No existe compose en $base";
+  (cd "$base" && compose down)
+  say "Stack '$name' detenido."
+}
+
+stack_ps() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "Uso: $0 ps <stack>";
+  local base; base="$(stack_path "$name")"
+  (cd "$base" && compose ps)
+}
+
+stack_logs() {
+  local name="${1:-}"; shift || true
+  local base; base="$(stack_path "$name")"
+  (cd "$base" && compose logs --tail=200 -f "$@")
+}
+
+stack_exec() {
+  local name="${1:-}"; local svc="${2:-}"; shift 2 || true
+  [[ -n "$name" && -n "$svc" ]] || die "Uso: $0 exec <stack> <service> [cmd]";
+  local base; base="$(stack_path "$name")"
+  (cd "$base" && compose exec "$svc" "${@:-/bin/sh}")
+}
+
+stack_shell() {
+  local name="${1:-}"; local svc="${2:-app}"
+  stack_exec "$name" "$svc" /bin/sh
+}
+
+stack_update() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "Uso: $0 update <stack>";
+  local base; base="$(stack_path "$name")"
+  (cd "$base" && compose pull && compose up -d)
+  say "Stack '$name' actualizado (pull + up -d)."
+}
+
+# ====== BACKUP / RESTORE ======
+backup() {
+  need_root
+  local name="${1:-}"; [[ -n "$name" ]] || die "Uso: $0 backup <stack>";
+  local base; base="$(stack_path "$name")"
+  [[ -d "$base" ]] || die "No existe $base";
+
+  mkdir -p "$BACKUP_ROOT/$name"
+  local ts; ts="$(timestamp)"
+  local out="$BACKUP_ROOT/$name/${name}-${ts}.tar.gz"
+
+  tar -C "$CONTAINERS_ROOT" -czf "$out" "$name"
+
+  ls -1t "$BACKUP_ROOT/$name"/*.tar.gz 2>/dev/null | tail -n +8 | xargs -r rm -f
+
+  say "Backup creado: $out"
+}
+
+restore() {
+  need_root
+  local name="${1:-}"; local file="${2:-}"
+  [[ -n "$name" && -n "$file" ]] || die "Uso: $0 restore <stack> <archivo .tar.gz>";
+  [[ -f "$file" ]] || die "No existe el archivo $file";
+
+  if [[ -f "$(stack_path "$name")/docker-compose.yml" ]]; then
+    (cd "$(stack_path "$name")" && compose down) || warn "No se pudo detener el stack, continuando..."
+  fi
+
+  if [[ -d "$(stack_path "$name")" ]]; then
+      warn "El stack '$name' ya existe. Esto sobreescribirá su contenido."
+      read -r -p "¿Continuar? (yes/NO) " a
+      [[ "${a:-NO}" == "yes" ]] || die "Restauración cancelada."
+      rm -rf "$(stack_path "$name")"
+  fi
+
+  tar -C "$CONTAINERS_ROOT" -xzf "$file"
+  say "Restaurado stack '$name' desde $file"
+  [[ -f "$(stack_path "$name")/docker-compose.yml" ]] && (cd "$(stack_path "$name")" && compose up -d)
+}
+
+# ====== LIMPIEZA (PRUNE) ======
+prune() {
+  need_root
+  warn "Esto eliminará imágenes, contenedores, redes y volúmenes sin uso."
+  read -r -p "¿Continuar? (yes/NO) " a
+  [[ "${a:-NO}" == "yes" ]] || { warn "Cancelado."; exit 0; }
+  docker system prune -af
+  read -r -p "¿Prune de volúmenes también? (yes/NO) " b
+  if [[ "${b:-NO}" == "yes" ]]; then
+    docker volume prune -f
+  fi
+  say "Limpieza completada."
+}
+
+status() {
+  echo "Docker: $(docker --version 2>/dev/null || echo 'no instalado')"
+  echo "Compose: $(docker compose version 2>/dev/null || echo 'no disponible')"
+  echo "Root contenedores: $CONTAINERS_ROOT"
+  echo "Backups: $BACKUP_ROOT"
+  echo "Bridge CIDR: $DOCKER_BRIDGE_CIDR"
+  local userns_remap_value="no"
+  if command -v jq &>/dev/null; then
+      userns_remap_t=$(jq -r '.["userns-remap"] // "no"' /etc/docker/daemon.json 2>/dev/null || true)
+      if [[ -n "$userns_remap_t" ]]; then
+          userns_remap_value="$userns_remap_t"
+      fi
+  fi
+  echo "Userns-remap: $userns_remap_value"
+}
+
+edit() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "Uso: $0 edit <stack>";
+  "$DEFAULT_EDITOR" "$(stack_path "$name")/docker-compose.yml"
+}
+
+# ====== GENERADOR DE MENÚ ======
+mkmenu() {
+  need_root
+  /usr/bin/install -d -m 0755 "$(dirname "$MENU_PATH")"
+
+  cat >"$MENU_PATH" <<'MENU'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+DOCKCTL="/opt/share/dockctl"
+ROOT_CMDS=("install" "harden" "backup" "restore" "prune")
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+need_main() { [[ -x "$DOCKCTL" ]] || { echo "[✘] No encuentro $DOCKCTL (o no es ejecutable)"; exit 1; }; }
+
+run_dockctl() {
+  local sub="$1"; shift || true
+  for c in "${ROOT_CMDS[@]}"; do
+    if [[ "$c" == "$sub" ]]; then
+      if [[ $EUID -ne 0 ]]; then
+        exec sudo "$DOCKCTL" "$sub" "$@"
+      else
+        exec "$DOCKCTL" "$sub" "$@"
+      fi
+    fi
+  done
+  exec "$DOCKCTL" "$sub" "$@"
+}
+
+pause() { read -rp "Pulsa ENTER para continuar... " _; }
+
+menu_loop() {
+  need_main
+  while true; do
+    clear
+    echo "================== DOCKCTL :: MENÚ =================="
+    echo "1) Instalar Docker + Compose"
+    echo "2) Hardening Docker"
+    echo "-----------------------------------------------------"
+    echo "3) Crear nuevo stack"
+    echo "4) Levantar stack (up)"
+    echo "5) Detener stack (down)"
+    echo "6) Ver servicios (ps)"
+    echo "7) Logs de stack"
+    echo "8) Exec en servicio"
+    echo "9) Shell /bin/sh en servicio"
+    echo "10) Actualizar stack (pull + up -d)"
+    echo "-----------------------------------------------------"
+    echo "11) Backup de stack"
+    echo "12) Restaurar stack"
+    echo "13) Limpieza (prune)"
+    echo "14) Status"
+    echo "15) Editar compose del stack"
+    echo "0) Salir"
+    echo "====================================================="
+    read -rp "Elige una opción: " opt
+
+    case "${opt:-}" in
+      1) run_dockctl install ;;
+      2) run_dockctl harden ;;
+      3) read -rp "Nombre del stack: " n; [[ -n "${n:-}" ]] && run_dockctl new "$n" || true ;;
+      4) read -rp "Stack: " n; [[ -n "${n:-}" ]] && run_dockctl up "$n" || true ;;
+      5) read -rp "Stack: " n; [[ -n "${n:-}" ]] && run_dockctl down "$n" || true ;;
+      6) read -rp "Stack: " n; [[ -n "${n:-}" ]] && "$DOCKCTL" ps "$n" || true; pause ;;
+      7) read -rp "Stack: " n; [[ -n "${n:-}" ]] && "$DOCKCTL" logs "$n" || true; pause ;;
+      8) read -rp "Stack: " n; read -rp "Servicio: " s; 
+         [[ -n "${n:-}" && -n "${s:-}" ]] && "$DOCKCTL" exec "$n" "$s" || true; pause ;;
+      9) read -rp "Stack: " n; read -rp "Servicio (por defecto: app): " s; 
+         s="${s:-app}"; [[ -n "${n:-}" ]] && "$DOCKCTL" shell "$n" "$s" || true; pause ;;
+      10) read -rp "Stack: " n; [[ -n "${n:-}" ]] && "$DOCKCTL" update "$n" || true; pause ;;
+      11) read -rp "Stack: " n; [[ -n "${n:-}" ]] && run_dockctl backup "$n" || true; pause ;;
+      12) read -rp "Stack: " n; read -rp "Ruta del .tar.gz: " f; 
+          [[ -n "${n:-}" && -f "${f:-}" ]] && run_dockctl restore "$n" "$f" || true; pause ;;
+      13) run_dockctl prune; pause ;;
+      14) "$DOCKCTL" status; pause ;;
+      15) read -rp "Stack: " n; [[ -n "${n:-}" ]] && "$DOCKCTL" edit "$n" || true; pause ;;
+      0) exit 0 ;;
+      *) echo "Opción inválida."; sleep 1 ;;
+    esac
+  done
+}
+
+menu_loop
+MENU
+
+  chmod +x "$MENU_PATH"
+
+  # Symlink opcional para comodidad
+  if [[ -d /usr/local/bin ]]; then
+    ln -sf "$MENU_PATH" /usr/local/bin/dockmenu
+  fi
+
+  say "Menú creado en: $MENU_PATH"
+  say "Atajo: /usr/local/bin/dockmenu"
+}
+
+usage() {
+  cat <<EOF
+Uso: $0 <comando> [args]
+
+Instalación / Hardening:
+  install             Instala Docker Engine + Compose plugin y prepara el sistema (genera menú)
+  harden              Aplica hardening (userns-remap, live-restore, logs, UFW, redes)
+  mkmenu              Genera/actualiza el script de menú interactivo en ${MENU_PATH}
+
+Stacks:
+  new <stack>         Crea estructura base del stack en ${CONTAINERS_ROOT}/<stack>
+  up <stack>          Levanta el stack (compose up -d)
+  down <stack>        Detiene el stack (compose down)
+  ps <stack>          Estado de servicios del stack
+  logs <stack> [svc]  Logs del stack (seguir con -f)
+  exec <stack> <svc> [...] Ejecutar comando dentro del servicio
+  shell <stack> [svc] Shell /bin/sh en el servicio (por defecto: app)
+  update <stack>      Pull + up -d (actualización)
+
+Backups:
+  backup <stack>      Backup del directorio del stack a ${BACKUP_ROOT}/<stack> (rotación 7)
+  restore <stack> <file> Restaura un backup .tar.gz
+
+Mantenimiento:
+  prune               Limpieza manual (pregunta antes)
+  status              Info rápida del entorno
+  edit <stack>        Edita el docker-compose.yml del stack
+EOF
+}
+
+# ====== DISPATCH ======
+cmd="${1:-usage}"; shift || true
+case "$cmd" in
+  install) do_install "$@" ;;
+  harden) harden "$@" ;;
+  mkmenu) mkmenu "$@" ;;
+  new) new_stack "$@" ;;
+  up) stack_up "$@" ;;
+  down) stack_down "$@" ;;
+  ps) stack_ps "$@" ;;
+  logs) stack_logs "$@" ;;
+  exec) stack_exec "$@" ;;
+  shell) stack_shell "$@" ;;
+  update) stack_update "$@" ;;
+  backup) backup "$@" ;;
+  restore) restore "$@" ;;
+  prune) prune "$@" ;;
+  status) status "$@" ;;
+  edit) edit "$@" ;;
+  *) usage ;;
+esac
